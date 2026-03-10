@@ -288,7 +288,8 @@ Output format: Just the expression string, nothing else.
             response = api.build_messages_and_create_chat_completion(
                 user_prompt=user_prompt,
                 system_prompt=system_prompt,
-                temperature=0.1
+                temperature=0.1,
+                caller_tag="factor_expression_correction"
             )
             
             expr = response.strip().strip('"\'')

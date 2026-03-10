@@ -173,6 +173,7 @@ class QlibFactorHypothesisExperiment2Feedback(HypothesisExperiment2Feedback):
                     user_prompt=usr_prompt,
                     system_prompt=sys_prompt,
                     json_mode=True,
+                    caller_tag="factor_feedback_generation",
                 )
                 # Parse the JSON response using robust parser
                 response_json = robust_json_parse(response)
@@ -302,6 +303,7 @@ class AlphaAgentQlibFactorHypothesisExperiment2Feedback(HypothesisExperiment2Fee
                     user_prompt=usr_prompt,
                     system_prompt=sys_prompt,
                     json_mode=True,
+                    caller_tag="alpha_agent_factor_feedback_generation",
                 )
                 # Parse the JSON response using robust parser
                 response_json = robust_json_parse(response)
@@ -380,6 +382,7 @@ class QlibModelHypothesisExperiment2Feedback(HypothesisExperiment2Feedback):
                     user_prompt=user_prompt,
                     system_prompt=system_prompt,
                     json_mode=True,
+                    caller_tag="model_feedback_generation",
                 )
                 # Parse the JSON response using robust parser
                 response_json_hypothesis = robust_json_parse(response_hypothesis)
