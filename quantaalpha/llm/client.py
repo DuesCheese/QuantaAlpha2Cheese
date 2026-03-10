@@ -833,11 +833,16 @@ class APIBackend:
         if LLM_SETTINGS.log_llm_chat_content:
             logger.info(self._build_log_messages(messages), tag="llm_messages")
         # TODO: fail to use loguru adaptor due to stream response
-        input_content_json = json.dumps(messages)
-        input_content_json = (
-            chat_cache_prefix + input_content_json + f"<seed={seed}/>"
-        )  # FIXME this is a hack to make sure the cache represents the round index
+        input_content_json = None
+        # NOTE: `messages` can be very large; only serialize it when cache read/write is enabled.
+        if self.use_chat_cache or self.dump_chat_cache:
+            input_content_json = json.dumps(messages)
+            input_content_json = (
+                chat_cache_prefix + input_content_json + f"<seed={seed}/>"
+            )  # FIXME this is a hack to make sure the cache represents the round index
+
         if self.use_chat_cache:
+            assert input_content_json is not None
             cache_result = self.cache.chat_get(input_content_json)
             if cache_result is not None:
                 if LLM_SETTINGS.log_llm_chat_content:
@@ -984,7 +989,7 @@ class APIBackend:
                         logger.info("Fixed JSON format issues")
                     except json.JSONDecodeError as e2:
                         logger.warning(f"JSON fix failed: {e2}, using raw response")
-        if self.dump_chat_cache:
+        if self.dump_chat_cache and input_content_json is not None:
             self.cache.chat_set(input_content_json, resp)
         return resp, finish_reason
 
