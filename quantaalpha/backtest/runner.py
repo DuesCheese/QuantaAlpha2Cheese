@@ -8,6 +8,8 @@ import json
 import logging
 import sys
 import time
+import gc
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 
@@ -204,29 +206,18 @@ class BacktestRunner:
     def _create_dataset_with_computed_factors(self,
                                               factor_expressions: Dict[str, str],
                                               computed_factors: pd.DataFrame):
-        """Create dataset from precomputed factors: compute label, merge with factors, use custom DataHandler."""
+        """Create dataset from precomputed factors with optional low-memory lazy loading."""
         from qlib.data.dataset import DatasetH
         from qlib.data.dataset.handler import DataHandler
-        from qlib.data import D
-        
-        data_config = self.config['data']
+
         dataset_config = self.config['dataset']
+        low_memory_mode = dataset_config.get('low_memory', False)
+        feature_chunk_size = int(dataset_config.get('feature_chunk_size', 16))
         
         logger.debug(f"  Computed factor count: {len(computed_factors.columns)}")
         label_expr = dataset_config['label']
         label_df = self._compute_label(label_expr)
         
-        all_feature_dfs = [computed_factors]
-        if factor_expressions:
-            logger.debug(f"  Loading {len(factor_expressions)} Qlib-compatible factors")
-            qlib_factors = self._load_qlib_factors(factor_expressions)
-            if qlib_factors is not None and not qlib_factors.empty:
-                all_feature_dfs.append(qlib_factors)
-        
-        features_df = pd.concat(all_feature_dfs, axis=1)
-        features_df = features_df.loc[:, ~features_df.columns.duplicated()]
-        logger.debug(f"  Total factor count: {len(features_df.columns)}")
-
         def _normalize_multiindex(df, df_name):
             """Ensure MultiIndex has standard (datetime, instrument) level names."""
             if not isinstance(df.index, pd.MultiIndex):
@@ -263,28 +254,28 @@ class BacktestRunner:
             
             return df
         
-        features_df = _normalize_multiindex(features_df, "features")
+        computed_factors = _normalize_multiindex(computed_factors, "computed_features")
         label_df = _normalize_multiindex(label_df, "label")
         
-        common_index = features_df.index.intersection(label_df.index)
-        if len(common_index) == 0 and len(features_df) > 0 and len(label_df) > 0:
+        common_index = computed_factors.index.intersection(label_df.index)
+        if len(common_index) == 0 and len(computed_factors) > 0 and len(label_df) > 0:
             logger.warning("  Index intersection empty, aligning datetime types...")
-            feat_dt = features_df.index.get_level_values('datetime')
+            feat_dt = computed_factors.index.get_level_values('datetime')
             label_dt = label_df.index.get_level_values('datetime')
-            logger.debug(f"  features datetime dtype={feat_dt.dtype}, sample={feat_dt[:3].tolist()}")
+            logger.debug(f"  computed_features datetime dtype={feat_dt.dtype}, sample={feat_dt[:3].tolist()}")
             logger.debug(f"  label    datetime dtype={label_dt.dtype}, sample={label_dt[:3].tolist()}")
             
-            feat_inst = features_df.index.get_level_values('instrument')
+            feat_inst = computed_factors.index.get_level_values('instrument')
             label_inst = label_df.index.get_level_values('instrument')
-            logger.debug(f"  features instrument sample={feat_inst[:3].tolist()}")
+            logger.debug(f"  computed_features instrument sample={feat_inst[:3].tolist()}")
             logger.debug(f"  label    instrument sample={label_inst[:3].tolist()}")
             
             try:
                 if not pd.api.types.is_datetime64_any_dtype(feat_dt):
-                    features_df.index = features_df.index.set_levels(
+                    computed_factors.index = computed_factors.index.set_levels(
                         pd.to_datetime(feat_dt.unique()), level='datetime'
                     )
-                    logger.debug("  features datetime converted to Timestamp")
+                    logger.debug("  computed_features datetime converted to Timestamp")
                 if not pd.api.types.is_datetime64_any_dtype(label_dt):
                     label_df.index = label_df.index.set_levels(
                         pd.to_datetime(label_dt.unique()), level='datetime'
@@ -292,74 +283,97 @@ class BacktestRunner:
                     logger.debug("  label datetime converted to Timestamp")
             except Exception as e:
                 logger.warning(f"  datetime type conversion failed: {e}")
-            common_index = features_df.index.intersection(label_df.index)
+            common_index = computed_factors.index.intersection(label_df.index)
             logger.debug(f"  Intersection size after align: {len(common_index)}")
 
         if len(common_index) == 0:
-            logger.warning("  Index intersection still empty, trying merge...")
-            feat_reset = features_df.reset_index()
-            label_reset = label_df.reset_index()
-            dt_col = 'datetime' if 'datetime' in feat_reset.columns else feat_reset.columns[0]
-            inst_col = 'instrument' if 'instrument' in feat_reset.columns else feat_reset.columns[1]
-            
-            merged = pd.merge(
-                feat_reset, label_reset,
-                on=[dt_col, inst_col],
-                how='inner'
+            raise ValueError(
+                f"Factor and label data could not be aligned by index join. "
+                f"computed_features: {len(computed_factors)} rows, index names={list(computed_factors.index.names)}; "
+                f"label: {len(label_df)} rows, index names={list(label_df.index.names)}"
             )
-            logger.debug(f"  Merged rows: {len(merged)}")
-            if len(merged) == 0:
-                raise ValueError(
-                    f"Factor and label data could not be aligned. "
-                    f"features: {len(features_df)} rows, index names={list(features_df.index.names)}; "
-                    f"label: {len(label_df)} rows, index names={list(label_df.index.names)}"
-                )
-            
-            merged = merged.set_index([dt_col, inst_col])
-            merged.index.names = ['datetime', 'instrument']
-            
-            feature_cols = [c for c in features_df.columns if c in merged.columns]
-            label_cols = [c for c in label_df.columns if c in merged.columns]
-            features_df = merged[feature_cols]
-            label_df = merged[label_cols]
-        else:
-            features_df = features_df.loc[common_index]
-            label_df = label_df.loc[common_index]
-        
-        logger.debug(f"  Data rows: {len(features_df)}")
-        if len(features_df) == 0:
+
+        computed_factors = computed_factors.loc[common_index]
+        label_df = label_df.loc[common_index]
+
+        logger.debug(f"  Data rows: {len(computed_factors)}")
+        if len(computed_factors) == 0:
             raise ValueError("No rows after index alignment; cannot run backtest")
-        combined_df = pd.concat([features_df, label_df], axis=1)
-        from qlib.data.dataset.processor import Fillna, ProcessInf, CSRankNorm, DropnaLabel
-        feature_cols = list(features_df.columns)
+
         label_cols = list(label_df.columns)
-        combined_df[feature_cols] = combined_df[feature_cols].fillna(0)
-        combined_df[feature_cols] = combined_df[feature_cols].replace([np.inf, -np.inf], 0)
-        dt_level = combined_df.index.names[0] if combined_df.index.names[0] else 0
-        for col in feature_cols:
-            combined_df[col] = combined_df.groupby(level=dt_level)[col].transform(
-                lambda x: (x.rank(pct=True) - 0.5) if len(x) > 1 else 0
-            )
-        combined_df = combined_df.dropna(subset=label_cols)
+        dt_level = label_df.index.names[0] if label_df.index.names[0] else 0
+        label_df = label_df.dropna(subset=label_cols)
         for col in label_cols:
-            combined_df[col] = combined_df.groupby(level=dt_level)[col].transform(
+            label_df[col] = label_df.groupby(level=dt_level)[col].transform(
                 lambda x: (x.rank(pct=True) - 0.5) if len(x) > 1 else 0
             )
-        
-        logger.debug(f"  Rows after preprocessing: {len(combined_df)}")
-        feature_tuples = [('feature', col) for col in feature_cols]
-        label_tuples = [('label', col) for col in label_cols]
-        
-        combined_df_multi = combined_df.copy()
-        combined_df_multi.columns = pd.MultiIndex.from_tuples(
-            feature_tuples + label_tuples
-        )
+
+        valid_index = label_df.index
+        logger.debug(f"  Rows after label preprocessing: {len(valid_index)}")
+
+        feature_storage: Dict[str, Any] = {'mode': 'memory', 'data': {}, 'column_to_key': {}}
+        feature_cols: List[str] = []
+
+        def _prepare_feature_chunk(df_chunk: pd.DataFrame) -> pd.DataFrame:
+            chunk = df_chunk.loc[valid_index].copy()
+            chunk = chunk.loc[:, ~chunk.columns.duplicated()]
+            chunk = chunk.fillna(0)
+            chunk = chunk.replace([np.inf, -np.inf], 0)
+            dt_lv = chunk.index.names[0] if chunk.index.names[0] else 0
+            for c in chunk.columns:
+                chunk[c] = chunk.groupby(level=dt_lv)[c].transform(
+                    lambda x: (x.rank(pct=True) - 0.5) if len(x) > 1 else 0
+                )
+            return chunk
+
+        def _store_feature_chunk(df_chunk: pd.DataFrame, key: str):
+            prepared_chunk = _prepare_feature_chunk(df_chunk)
+            if prepared_chunk.empty:
+                return
+            cols = list(prepared_chunk.columns)
+            feature_cols.extend(cols)
+            for c in cols:
+                feature_storage['column_to_key'][c] = key
+            if low_memory_mode:
+                feature_storage['mode'] = 'disk'
+                base_dir = feature_storage.setdefault('base_dir', Path(tempfile.mkdtemp(prefix='qa_features_')))
+                file_path = base_dir / f"{key}.parquet"
+                prepared_chunk.to_parquet(file_path)
+                feature_storage['data'][key] = str(file_path)
+            else:
+                feature_storage['data'][key] = prepared_chunk
+
+        computed_cols = list(computed_factors.columns)
+        for idx in range(0, len(computed_cols), feature_chunk_size):
+            cols = computed_cols[idx:idx + feature_chunk_size]
+            _store_feature_chunk(computed_factors[cols], f"computed_{idx // feature_chunk_size:04d}")
+        del computed_factors
+        gc.collect()
+
+        if factor_expressions:
+            logger.debug(f"  Loading {len(factor_expressions)} Qlib-compatible factors in chunks")
+            expressions = list(factor_expressions.values())
+            names = list(factor_expressions.keys())
+            for idx in range(0, len(names), feature_chunk_size):
+                name_chunk = names[idx:idx + feature_chunk_size]
+                expr_chunk = expressions[idx:idx + feature_chunk_size]
+                qlib_factors = self._load_qlib_factor_chunk(name_chunk, expr_chunk)
+                if qlib_factors is None or qlib_factors.empty:
+                    continue
+                qlib_factors = _normalize_multiindex(qlib_factors, f"qlib_chunk_{idx // feature_chunk_size:04d}")
+                _store_feature_chunk(qlib_factors, f"qlib_{idx // feature_chunk_size:04d}")
+                del qlib_factors
+                gc.collect()
+
+        feature_cols = list(dict.fromkeys(feature_cols))
+        logger.debug(f"  Total factor count: {len(feature_cols)}")
         
         class PrecomputedDataHandler(DataHandler):
             """DataHandler for precomputed data."""
             
-            def __init__(self, data_df, segments):
-                self._data = data_df
+            def __init__(self, feature_store, label_data, segments):
+                self._feature_store = feature_store
+                self._label_data = label_data
                 self._segments = segments
             
             @property
@@ -369,38 +383,69 @@ class BacktestRunner:
             @property
             def instruments(self):
                 try:
-                    return list(self._data.index.get_level_values('instrument').unique())
+                    return list(self._label_data.index.get_level_values('instrument').unique())
                 except KeyError:
-                    return list(self._data.index.get_level_values(1).unique())
+                    return list(self._label_data.index.get_level_values(1).unique())
+
+            def _apply_selector(self, result, selector):
+                if selector is None:
+                    return result
+                if isinstance(selector, str):
+                    selector = self._segments.get(selector, selector)
+                try:
+                    dates = result.index.get_level_values('datetime')
+                except KeyError:
+                    dates = result.index.get_level_values(0)
+                if isinstance(selector, (tuple, list)) and len(selector) == 2:
+                    start, end = selector
+                    mask = (dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))
+                    return result.loc[mask]
+                if isinstance(selector, slice):
+                    start = selector.start
+                    end = selector.stop
+                    if start is not None and end is not None:
+                        mask = (dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))
+                        return result.loc[mask]
+                return result
+
+            def _load_feature_columns(self, columns):
+                if not columns:
+                    return pd.DataFrame(index=self._label_data.index)
+                grouped_keys: Dict[str, List[str]] = {}
+                for c in columns:
+                    key = self._feature_store['column_to_key'][c]
+                    grouped_keys.setdefault(key, []).append(c)
+                parts = []
+                for key, cols in grouped_keys.items():
+                    source = self._feature_store['data'][key]
+                    if self._feature_store['mode'] == 'disk':
+                        part = pd.read_parquet(source, columns=cols)
+                    else:
+                        part = source[cols]
+                    parts.append(part)
+                if len(parts) == 1:
+                    return parts[0]
+                return pd.concat(parts, axis=1)
             
             def fetch(self, selector=None, level='datetime', col_set='feature',
                      data_key=None, squeeze=False, proc_func=None):
                 if col_set in ('feature', 'label'):
-                    result = self._data[col_set].copy()
+                    result = self._load_feature_columns(feature_cols) if col_set == 'feature' else self._label_data
                 elif col_set == '__all' or col_set is None:
-                    result = self._data.copy()
+                    features = self._load_feature_columns(feature_cols)
+                    feature_multi = features.copy()
+                    feature_multi.columns = pd.MultiIndex.from_tuples([('feature', c) for c in features.columns])
+                    label_multi = self._label_data.copy()
+                    label_multi.columns = pd.MultiIndex.from_tuples([('label', c) for c in label_multi.columns])
+                    result = pd.concat([feature_multi, label_multi], axis=1)
                 else:
                     if isinstance(col_set, (list, tuple)):
-                        result = self._data[list(col_set)].copy()
+                        requested = [c for c in list(col_set) if c in feature_cols]
+                        result = self._load_feature_columns(requested)
                     else:
-                        result = self._data.copy()
-                if selector is not None:
-                    if isinstance(selector, str):
-                        selector = self._segments.get(selector, selector)
-                    try:
-                        dates = result.index.get_level_values('datetime')
-                    except KeyError:
-                        dates = result.index.get_level_values(0)
-                    if isinstance(selector, (tuple, list)) and len(selector) == 2:
-                        start, end = selector
-                        mask = (dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))
-                        result = result.loc[mask]
-                    elif isinstance(selector, slice):
-                        start = selector.start
-                        end = selector.stop
-                        if start is not None and end is not None:
-                            mask = (dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))
-                            result = result.loc[mask]
+                        result = self._load_feature_columns(feature_cols)
+
+                result = self._apply_selector(result, selector)
                 
                 if squeeze and result.shape[1] == 1:
                     result = result.iloc[:, 0]
@@ -408,9 +453,9 @@ class BacktestRunner:
                 return result
             
             def get_cols(self, col_set='feature'):
-                if col_set in self._data.columns.get_level_values(0):
-                    return list(self._data[col_set].columns)
-                return list(self._data.columns.get_level_values(1))
+                if col_set == 'label':
+                    return list(self._label_data.columns)
+                return feature_cols
             
             def setup_data(self, **kwargs):
                 pass
@@ -418,15 +463,40 @@ class BacktestRunner:
             def config(self, **kwargs):
                 pass
         
-        handler = PrecomputedDataHandler(combined_df_multi, dataset_config['segments'])
+        handler = PrecomputedDataHandler(feature_storage, label_df, dataset_config['segments'])
         dataset = DatasetH(
             handler=handler,
             segments=dataset_config['segments']
         )
         
-        logger.debug(f"  Custom factor mode: {len(feature_cols)} factors, {len(combined_df)} rows, train={dataset_config['segments']['train']}")
+        logger.debug(
+            f"  Custom factor mode: {len(feature_cols)} factors, {len(label_df)} rows, "
+            f"low_memory={low_memory_mode}, train={dataset_config['segments']['train']}"
+        )
+        gc.collect()
         
         return dataset
+
+    def _load_qlib_factor_chunk(self, factor_names: List[str], factor_expressions: List[str]) -> Optional[pd.DataFrame]:
+        """Load a chunk of Qlib-compatible factors."""
+        from qlib.data import D
+
+        data_config = self.config['data']
+
+        try:
+            stock_list = D.instruments(data_config['market'])
+            df = D.features(
+                stock_list,
+                factor_expressions,
+                start_time=data_config['start_time'],
+                end_time=data_config['end_time'],
+                freq='day'
+            )
+            df.columns = factor_names
+            return df
+        except Exception as e:
+            logger.warning(f"Failed to load Qlib factor chunk: {e}")
+            return None
     
     def _compute_label(self, label_expr: str) -> pd.DataFrame:
         """Compute label using Qlib (label requires look-ahead)."""

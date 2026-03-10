@@ -53,6 +53,8 @@ data:
 
 dataset:
   label: "Ref($close, -2) / Ref($close, -1) - 1"
+  low_memory: true
+  feature_chunk_size: 16
 
   learn_processors:
     - class: "Fillna"
