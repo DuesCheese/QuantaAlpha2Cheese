@@ -72,7 +72,7 @@ npm run dev
 
 ### 访问
 - 🌐 **前端**: http://localhost:3000
-- 🔧 **API 文档**: http://localhost:8000/docs
+- 🔧 **API 文档**: http://localhost:8005/docs
 
 ## 📖 使用指南
 

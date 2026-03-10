@@ -2,7 +2,7 @@
  * QuantaAlpha API Service
  *
  * Centralized API client for communicating with the FastAPI backend.
- * Uses fetch (no extra dependency) with the Vite proxy (/api -> localhost:8000).
+ * Uses fetch (no extra dependency) with the Vite proxy (/api -> localhost:8005).
  */
 
 import type {
