@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import warnings
+import gc
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -206,7 +207,8 @@ class CustomFactorCalculator:
             )
             import quantaalpha.factors.coder.function_lib as func_lib
             
-            df = self.data_df.copy()
+            # Read-only reference: computation path must not mutate self.data_df in-place.
+            df = self.data_df
             
             expr = parse_symbol(factor_expression, df.columns)
             
@@ -252,9 +254,12 @@ class CustomFactorCalculator:
                         result = result[~result.index.duplicated(keep='last')]
                         clean_idx = df.index[~df.index.duplicated(keep='last')]
                         result = result.reindex(clean_idx)
-                return result.astype(np.float64)
+                result = result.astype(np.float32)
+                return result
             else:
-                return pd.Series(result, index=df.index, name=factor_name).astype(np.float64)
+                result = pd.Series(result, index=df.index, name=factor_name)
+                result = result.astype(np.float32)
+                return result
                 
         except Exception as e:
             logger.warning(f"Factor computation failed [{factor_name}]: {str(e)[:200]}")
@@ -305,7 +310,7 @@ class CustomFactorCalculator:
         return pd.DataFrame()
     
     def calculate_factors_batch(self, factors: List[Dict], use_cache: bool = True,
-                                skip_compute: bool = False) -> pd.DataFrame:
+                                skip_compute: bool = False, batch_size: int = 5) -> pd.DataFrame:
         """
         Batch compute factors. Priority: 1) cache_location (result.h5),
         2) MD5 cache (factor_cache dir), 3) recompute from factor_expression
@@ -316,7 +321,33 @@ class CustomFactorCalculator:
         if use_cache and self.auto_extract_cache:
             self._auto_extract_cache_from_logs()
         
-        results = {}
+        if batch_size <= 0:
+            batch_size = 5
+
+        batch_output_dir = self.cache_dir / "factor_batches"
+        batch_output_dir.mkdir(parents=True, exist_ok=True)
+        run_tag = f"batch_run_{int(_time.time())}"
+        run_dir = batch_output_dir / run_tag
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        batch_files: List[Path] = []
+        current_batch: Dict[str, pd.Series] = {}
+        batch_no = 0
+        reference_index = None
+
+        def _flush_current_batch():
+            nonlocal batch_no, current_batch
+            if not current_batch:
+                return
+            batch_no += 1
+            batch_df = pd.DataFrame(current_batch)
+            batch_file = run_dir / f"factors_batch_{batch_no:04d}.pkl"
+            batch_df.to_pickle(batch_file)
+            batch_files.append(batch_file)
+            current_batch.clear()
+            del batch_df
+            gc.collect()
+
         success_count = 0
         fail_count = 0
         cache_hit_count = 0
@@ -324,9 +355,8 @@ class CustomFactorCalculator:
         compute_count = 0
         failed_names = []
         total = len(factors)
-        need_compute_factors = []
-        
-        # Pass 1: load from cache
+
+        # Stream mode: read cache / compute one / write one / release one
         for i, factor_info in enumerate(factors):
             factor_name = factor_info.get('factor_name', 'unknown')
             factor_expr = factor_info.get('factor_expression', '')
@@ -338,6 +368,7 @@ class CustomFactorCalculator:
                 continue
             
             result = None
+            source = ""
             
             if use_cache and cache_location:
                 h5_path = cache_location.get('result_h5_path', '')
@@ -345,129 +376,126 @@ class CustomFactorCalculator:
                     result = self._load_from_cache_location(cache_location)
                     if result is not None:
                         cache_location_hit_count += 1
-                        results[factor_name] = result
-                        success_count += 1
-                        print(f"  [{i+1}/{total}] ✓ H5 cache: {factor_name}")
-                        continue
+                        source = "H5 cache"
             
-            if use_cache:
+            if result is None and use_cache:
                 result = self._load_from_cache(factor_expr)
                 if result is not None:
                     cache_hit_count += 1
-                    results[factor_name] = result
-                    success_count += 1
-                    print(f"  [{i+1}/{total}] ✓ MD5 cache: {factor_name}")
+                    source = "MD5 cache"
+
+            if result is None:
+                if skip_compute:
+                    fail_count += 1
+                    failed_names.append(factor_name)
+                    print(f"  [{i+1}/{total}] ⏭ Skip uncached (skip_compute=True): {factor_name}")
                     continue
-            
-            need_compute_factors.append((i, factor_info))
-            print(f"  [{i+1}/{total}] ⏳ Pending: {factor_name}")
-        
-        # Pass 2: compute uncached factors
-        if need_compute_factors:
-            if skip_compute:
-                skipped_count = len(need_compute_factors)
-                skipped_names = [f.get('factor_name', 'unknown') for _, f in need_compute_factors]
-                print(f"  Skipping {skipped_count} uncached factors (skip_compute=True)")
-                if skipped_names:
-                    print(f"  Skipped: {', '.join(skipped_names)}")
-            else:
-                print(f"  Computing {len(need_compute_factors)} factors from expressions...")
-                
-                for idx, (orig_i, factor_info) in enumerate(need_compute_factors):
-                    factor_name = factor_info.get('factor_name', 'unknown')
-                    factor_expr = factor_info.get('factor_expression', '')
-                    
-                    print(f"  Compute [{idx+1}/{len(need_compute_factors)}]: {factor_name} ...", end='', flush=True)
-                    t0 = _time.time()
-                    
+
+                print(f"  Compute [{i+1}/{total}]: {factor_name} ...", end='', flush=True)
+                t0 = _time.time()
+
+                try:
+                    import signal as _signal
+
+                    class _FactorTimeout(Exception):
+                        pass
+
+                    def _timeout_handler(signum, frame):
+                        raise _FactorTimeout()
+
+                    old_handler = None
                     try:
-                        import signal as _signal
-                        
-                        class _FactorTimeout(Exception):
-                            pass
-                        
-                        def _timeout_handler(signum, frame):
-                            raise _FactorTimeout()
-                        
-                        old_handler = None
-                        try:
-                            old_handler = _signal.signal(_signal.SIGALRM, _timeout_handler)
-                            _signal.alarm(120)
-                        except (AttributeError, ValueError):
-                            pass
-                        
-                        result = self.calculate_factor(factor_name, factor_expr)
-                        
-                        try:
-                            _signal.alarm(0)
-                            if old_handler is not None:
-                                _signal.signal(_signal.SIGALRM, old_handler)
-                        except (AttributeError, ValueError):
-                            pass
-                        
-                    except _FactorTimeout:
-                        elapsed = _time.time() - t0
-                        print(f" ✗ Timeout ({elapsed:.1f}s)")
-                        fail_count += 1
-                        failed_names.append(f"{factor_name}(timeout)")
-                        try:
-                            _signal.alarm(0)
-                            if old_handler is not None:
-                                _signal.signal(_signal.SIGALRM, old_handler)
-                        except (AttributeError, ValueError):
-                            pass
-                        continue
-                    except Exception as e:
-                        elapsed = _time.time() - t0
-                        print(f" ✗ Error ({elapsed:.1f}s): {str(e)[:80]}")
-                        fail_count += 1
-                        failed_names.append(factor_name)
-                        continue
-                    
+                        old_handler = _signal.signal(_signal.SIGALRM, _timeout_handler)
+                        _signal.alarm(120)
+                    except (AttributeError, ValueError):
+                        pass
+
+                    result = self.calculate_factor(factor_name, factor_expr)
+
+                    try:
+                        _signal.alarm(0)
+                        if old_handler is not None:
+                            _signal.signal(_signal.SIGALRM, old_handler)
+                    except (AttributeError, ValueError):
+                        pass
+
+                except _FactorTimeout:
                     elapsed = _time.time() - t0
-                    
-                    if result is not None and len(result) > 0:
-                        if not result.isna().all():
-                            results[factor_name] = result
-                            success_count += 1
-                            compute_count += 1
-                            print(f" ✓ ({elapsed:.1f}s)")
-                            if use_cache:
-                                self._save_to_cache(factor_expr, result)
-                        else:
-                            fail_count += 1
-                            failed_names.append(factor_name)
-                            print(f" ✗ All NaN ({elapsed:.1f}s)")
-                    else:
-                        fail_count += 1
-                        failed_names.append(factor_name)
-                        print(f" ✗ Failed ({elapsed:.1f}s)")
+                    print(f" ✗ Timeout ({elapsed:.1f}s)")
+                    fail_count += 1
+                    failed_names.append(f"{factor_name}(timeout)")
+                    try:
+                        _signal.alarm(0)
+                        if old_handler is not None:
+                            _signal.signal(_signal.SIGALRM, old_handler)
+                    except (AttributeError, ValueError):
+                        pass
+                    continue
+                except Exception as e:
+                    elapsed = _time.time() - t0
+                    print(f" ✗ Error ({elapsed:.1f}s): {str(e)[:80]}")
+                    fail_count += 1
+                    failed_names.append(factor_name)
+                    continue
+
+                elapsed = _time.time() - t0
+                source = f"computed ({elapsed:.1f}s)"
+                compute_count += 1
+
+            validated = self._validate_and_align_result(result, factor_name, reference_index)
+            if validated is not None:
+                if reference_index is None:
+                    reference_index = validated.index
+                validated = validated.astype(np.float32)
+                current_batch[factor_name] = validated
+                success_count += 1
+                print(f"  [{i+1}/{total}] ✓ {source}: {factor_name}")
+
+                if source.startswith("computed") and use_cache:
+                    self._save_to_cache(factor_expr, validated)
+
+                if len(current_batch) >= batch_size:
+                    _flush_current_batch()
+            else:
+                fail_count += 1
+                failed_names.append(factor_name)
+                print(f"  [{i+1}/{total}] ✗ Failed/invalid: {factor_name}")
+
+            del result
+            gc.collect()
+
+        _flush_current_batch()
         
         print(f"Factor load done: success {success_count}, failed {fail_count} | "
               f"H5 cache {cache_location_hit_count}, MD5 cache {cache_hit_count}, computed {compute_count}")
         if failed_names:
             print(f"  Failed: {', '.join(failed_names)}")
         
-        if not results:
+        if not batch_files:
             return pd.DataFrame()
-        
-        # Align results to common index
-        aligned_results = {}
-        reference_index = None
-        
-        for name, series in results.items():
-            if reference_index is None:
-                reference_index = series.index
-            validated = self._validate_and_align_result(series, name, reference_index)
-            if validated is not None:
-                aligned_results[name] = validated
-        
-        if aligned_results:
-            result_df = pd.DataFrame(aligned_results)
-            logger.debug(f"  Result DataFrame: {result_df.shape}")
-            return result_df
-        
-        return pd.DataFrame()
+
+        # Only aggregate when needed by downstream model training.
+        aggregate_file = run_dir / "factors_aggregate.pkl"
+        aggregate_df = None
+        for batch_file in batch_files:
+            batch_df = pd.read_pickle(batch_file)
+            if aggregate_df is None:
+                aggregate_df = batch_df
+            else:
+                aggregate_df = pd.concat([aggregate_df, batch_df], axis=1)
+            del batch_df
+            gc.collect()
+
+        if aggregate_df is None:
+            return pd.DataFrame()
+
+        aggregate_df.to_pickle(aggregate_file)
+        del aggregate_df
+        gc.collect()
+
+        result_df = pd.read_pickle(aggregate_file)
+        logger.debug(f"  Result DataFrame: {result_df.shape} | aggregate: {aggregate_file}")
+        return result_df
     
     def _validate_and_align_result(self, result: pd.Series, factor_name: str, 
                                     reference_index: Optional[pd.Index] = None) -> Optional[pd.Series]:
