@@ -236,6 +236,24 @@ python -m quantaalpha.backtest.run_backtest \
 
 Results are saved to the directory specified in `configs/backtest.yaml` (`experiment.output_dir`).
 
+#### Recommended settings for 4G RAM machines (low-memory preset)
+
+For 4G machines, use `configs/backtest_low_mem.yaml` first to avoid OOM:
+
+- `model.params.num_threads: 1`
+- `factor_calculation.n_jobs: 1`
+- Start with a short backtest window (e.g., year 2022), then run segmented windows and aggregate metrics
+- For custom factors, keep cache enabled and start with cached-only factors using `--skip-uncached`
+
+```bash
+# 4G machine: run cached factors first to validate the full pipeline
+python -m quantaalpha.backtest.run_backtest \
+  -c configs/backtest_low_mem.yaml \
+  --factor-source custom \
+  --factor-json all_factors_library.json \
+  --skip-uncached -v
+```
+
 > 📘 Need help? Check our comprehensive **[User Guide](docs/user_guide.md)** for advanced configuration, experiment reproduction, and detailed usage examples.
 
 ---
