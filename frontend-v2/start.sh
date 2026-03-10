@@ -84,22 +84,22 @@ BACKEND_PID=""
 BACKEND_REUSED=false
 
 echo ""
-echo "🔍 检测后端服务 (端口 8000)..."
-if curl -s --connect-timeout 2 http://localhost:8000/api/health > /dev/null 2>&1; then
-    echo "✅ 后端服务已在运行中 (端口 8000)，复用现有服务"
+echo "🔍 检测后端服务 (端口 8005)..."
+if curl -s --connect-timeout 2 http://localhost:8005/api/health > /dev/null 2>&1; then
+    echo "✅ 后端服务已在运行中 (端口 8005)，复用现有服务"
     BACKEND_REUSED=true
-    BACKEND_PID=$(lsof -ti:8000 2>/dev/null | head -1)
+    BACKEND_PID=$(lsof -ti:8005 2>/dev/null | head -1)
 else
     # 清理可能占用端口但未正常服务的残留进程
-    OLD_PID=$(lsof -ti:8000 2>/dev/null)
+    OLD_PID=$(lsof -ti:8005 2>/dev/null)
     if [ -n "$OLD_PID" ]; then
-        echo "⚠️  端口 8000 被占用但服务异常，清理残留进程 (PID: $OLD_PID)..."
+        echo "⚠️  端口 8005 被占用但服务异常，清理残留进程 (PID: $OLD_PID)..."
         kill $OLD_PID 2>/dev/null
         sleep 1
         kill -9 $OLD_PID 2>/dev/null 2>&1
     fi
 
-    echo "🔧 启动后端服务 (端口 8000)..."
+    echo "🔧 启动后端服务 (端口 8005)..."
     cd "${SCRIPT_DIR}"
     python backend/app.py &
     BACKEND_PID=$!
@@ -107,7 +107,7 @@ else
     # 等待后端启动
     sleep 3
 
-    if curl -s http://localhost:8000/api/health > /dev/null 2>&1; then
+    if curl -s http://localhost:8005/api/health > /dev/null 2>&1; then
         echo "✅ 后端服务启动成功 (PID: $BACKEND_PID)"
     else
         echo "❌ 后端启动失败，请检查日志"
@@ -154,8 +154,8 @@ echo "   本机:     http://localhost:3000"
 if [ "$HOST_IP" != "localhost" ]; then
 echo "   局域网:   http://${HOST_IP}:3000"
 fi
-echo "   后端 API: http://localhost:8000"
-echo "   API 文档: http://localhost:8000/docs"
+echo "   后端 API: http://localhost:8005"
+echo "   API 文档: http://localhost:8005/docs"
 echo ""
 if [ "$BACKEND_REUSED" = true ] || [ "$FRONTEND_REUSED" = true ]; then
 echo "ℹ️  部分服务为复用已有进程（多用户共享模式）"

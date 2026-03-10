@@ -78,6 +78,9 @@ class SystemConfigUpdate(BaseModel):
     OPENAI_BASE_URL: Optional[str] = None
     CHAT_MODEL: Optional[str] = None
     REASONING_MODEL: Optional[str] = None
+    EMBEDDING_API_KEY: Optional[str] = None
+    EMBEDDING_BASE_URL: Optional[str] = None
+    EMBEDDING_MODEL: Optional[str] = None
 
 
 class ApiResponse(BaseModel):
@@ -1335,5 +1338,5 @@ def _update_mining_metrics(task: Dict[str, Any]):
 if __name__ == "__main__":
     import uvicorn
     host = os.environ.get("BACKEND_HOST", "0.0.0.0")
-    port = int(os.environ.get("BACKEND_PORT", "8000"))
+    port = int(os.environ.get("BACKEND_PORT", "8005"))
     uvicorn.run(app, host=host, port=port, log_level="info")

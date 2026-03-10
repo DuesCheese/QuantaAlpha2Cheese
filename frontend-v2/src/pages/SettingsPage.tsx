@@ -11,6 +11,9 @@ interface SystemConfig {
   apiKey: string;
   apiUrl: string;
   modelName: string;
+  embeddingApiKey: string;
+  embeddingApiUrl: string;
+  embeddingModelName: string;
   // Qlib
   qlibDataPath: string;
   resultsDir: string;
@@ -32,6 +35,9 @@ const DEFAULT_CONFIG: SystemConfig = {
   apiKey: '',
   apiUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   modelName: 'deepseek-v3',
+  embeddingApiKey: '',
+  embeddingApiUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+  embeddingModelName: 'text-embedding-004',
   qlibDataPath: '',
   resultsDir: '',
   defaultNumDirections: 2,
@@ -95,6 +101,9 @@ export const SettingsPage: React.FC = () => {
           apiKey: env.OPENAI_API_KEY || '',
           apiUrl: env.OPENAI_BASE_URL || DEFAULT_CONFIG.apiUrl,
           modelName: env.CHAT_MODEL || DEFAULT_CONFIG.modelName,
+          embeddingApiKey: env.EMBEDDING_API_KEY || env.GOOGLE_API_KEY || '',
+          embeddingApiUrl: env.EMBEDDING_BASE_URL || DEFAULT_CONFIG.embeddingApiUrl,
+          embeddingModelName: env.EMBEDDING_MODEL || DEFAULT_CONFIG.embeddingModelName,
           qlibDataPath: env.QLIB_DATA_DIR || '',
           resultsDir: env.DATA_RESULTS_DIR || '',
           defaultNumDirections: 2,
@@ -151,6 +160,11 @@ export const SettingsPage: React.FC = () => {
         update.CHAT_MODEL = config.modelName;
         update.REASONING_MODEL = config.modelName;
       }
+      if (config.embeddingApiKey && !config.embeddingApiKey.includes('...')) {
+        update.EMBEDDING_API_KEY = config.embeddingApiKey;
+      }
+      if (config.embeddingApiUrl) update.EMBEDDING_BASE_URL = config.embeddingApiUrl;
+      if (config.embeddingModelName) update.EMBEDDING_MODEL = config.embeddingModelName;
       if (config.qlibDataPath) update.QLIB_DATA_DIR = config.qlibDataPath;
       if (config.resultsDir) update.DATA_RESULTS_DIR = config.resultsDir;
 
@@ -320,6 +334,48 @@ export const SettingsPage: React.FC = () => {
                   placeholder="请输入模型名称，如 deepseek-v3"
                   className="w-full rounded-lg border border-input bg-background px-4 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary transition-all"
                 />
+              </div>
+
+
+
+              <div className="pt-4 border-t border-border/50 space-y-6">
+                <h4 className="text-sm font-medium">Embedding 配置（支持 Google）</h4>
+
+                <div>
+                  <label className="block text-sm font-medium mb-2">Embedding API Key</label>
+                  <input
+                    type={showApiKey ? 'text' : 'password'}
+                    value={config.embeddingApiKey}
+                    onChange={(e) => updateConfigField('embeddingApiKey', e.target.value)}
+                    placeholder="AIza..."
+                    className="w-full rounded-lg border border-input bg-background px-4 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary transition-all"
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Google 可直接填写 API Key，也可填写其他 embedding 服务密钥
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-2">Embedding Base URL</label>
+                  <input
+                    type="text"
+                    value={config.embeddingApiUrl}
+                    onChange={(e) => updateConfigField('embeddingApiUrl', e.target.value)}
+                    placeholder="https://generativelanguage.googleapis.com/v1beta/openai"
+                    className="w-full rounded-lg border border-input bg-background px-4 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary transition-all"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-2">Embedding 模型</label>
+                  <input
+                    type="text"
+                    value={config.embeddingModelName}
+                    onChange={(e) => updateConfigField('embeddingModelName', e.target.value)}
+                    placeholder="text-embedding-004"
+                    className="w-full rounded-lg border border-input bg-background px-4 py-2 text-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary transition-all"
+                  />
+                </div>
               </div>
 
               {/* Connection Status */}

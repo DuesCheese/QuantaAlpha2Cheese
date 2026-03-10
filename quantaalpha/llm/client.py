@@ -9,6 +9,7 @@ import re
 import sqlite3
 import ssl
 import time
+import urllib.error
 import urllib.request
 import uuid
 from copy import deepcopy
@@ -410,7 +411,10 @@ class APIBackend:
             )
             self.embedding_api_key = (
                 embedding_api_key
+                or LLM_SETTINGS.embedding_api_key
                 or LLM_SETTINGS.embedding_openai_api_key
+                or os.environ.get("EMBEDDING_API_KEY")
+                or os.environ.get("GOOGLE_API_KEY")
                 or LLM_SETTINGS.openai_api_key
                 or os.environ.get("OPENAI_API_KEY")
             )
@@ -423,11 +427,7 @@ class APIBackend:
             self.embedding_base_url = (
                 LLM_SETTINGS.embedding_base_url
                 or os.environ.get("EMBEDDING_BASE_URL")
-            )
-
-            self.embedding_api_key = (
-                LLM_SETTINGS.embedding_api_key
-                or os.environ.get("EMBEDDING_API_KEY")
+                or self.base_url
             )
             
 
@@ -444,6 +444,12 @@ class APIBackend:
             self.chat_seed = LLM_SETTINGS.chat_seed
 
             self.embedding_model = LLM_SETTINGS.embedding_model if embedding_model is None else embedding_model
+            if not self.embedding_model:
+                embedding_base = (self.embedding_base_url or "").lower()
+                if "generativelanguage.googleapis.com" in embedding_base or "googleapis.com" in embedding_base:
+                    self.embedding_model = "text-embedding-004"
+                else:
+                    self.embedding_model = "text-embedding-3-small"
             self.embedding_api_base = (
                 LLM_SETTINGS.embedding_azure_api_base if embedding_api_base is None else embedding_api_base
             )
@@ -657,6 +663,7 @@ class APIBackend:
                     return self._create_chat_completion_auto_continue(**kwargs)
             except openai.BadRequestError as e:  # noqa: PERF203
                 logger.warning(e)
+                logger.warning(f"request_type={'embedding' if embedding else 'chat'} model={self.embedding_model if embedding else self.chat_model}")
                 logger.warning(f"Retrying {i+1}th time...")
                 if "'messages' must contain the word 'json' in some form" in e.message:
                     kwargs["add_json_in_prompt"] = True
@@ -669,11 +676,59 @@ class APIBackend:
                     time.sleep(self.retry_wait_seconds)
             except Exception as e:  # noqa: BLE001
                 logger.warning(e)
+                logger.warning(f"request_type={'embedding' if embedding else 'chat'} model={self.embedding_model if embedding else self.chat_model}")
                 logger.warning(f"Retrying {i+1}th time...")
                 if i < max_retry - 1:
                     time.sleep(self.retry_wait_seconds)
         error_message = f"Failed to create chat completion after {max_retry} retries."
         raise RuntimeError(error_message)
+
+    def _create_google_native_embedding(self, input_content: str) -> list[float]:
+        """Call Google Generative Language native embedContent endpoint."""
+        base_url = (self.embedding_base_url or "").strip()
+        if not base_url:
+            raise RuntimeError("EMBEDDING_BASE_URL is required for Google native embedding endpoint")
+
+        model = (self.embedding_model or "text-embedding-004").strip()
+        if not model.startswith("models/"):
+            model = f"models/{model}"
+
+        lowered_base = base_url.lower()
+        if ":embedcontent" in lowered_base:
+            request_url = base_url
+            payload = {
+                "content": {"parts": [{"text": input_content}]},
+            }
+        else:
+            request_url = base_url.rstrip("/") + f"/{model}:embedContent"
+            payload = {
+                "model": model,
+                "content": {"parts": [{"text": input_content}]},
+            }
+
+        sep = "&" if "?" in request_url else "?"
+        if "key=" not in request_url:
+            request_url = f"{request_url}{sep}key={self.embedding_api_key}"
+
+        req = urllib.request.Request(
+            request_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req) as response:  # noqa: S310
+                response_data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
+            raise RuntimeError(
+                f"Google embedding HTTPError {e.code}, url={request_url}, model={model}, body={body}"
+            ) from e
+
+        values = response_data.get("embedding", {}).get("values")
+        if not isinstance(values, list):
+            raise RuntimeError(f"Invalid Google embedding response: {response_data}")
+        return values
 
     def _create_embedding_inner_function(
         self, input_content_list: list[str], **kwargs: Any
@@ -705,18 +760,24 @@ class APIBackend:
             ]
             
             for batch_idx, sliced_filtered_input_content_list in enumerate(batches):
-                if self.use_azure:
+                is_google_native_endpoint = "embedcontent" in (self.embedding_base_url or "").lower()
+                if is_google_native_endpoint and not self.use_azure:
+                    for content in sliced_filtered_input_content_list:
+                        content_to_embedding_dict[content] = self._create_google_native_embedding(content)
+                elif self.use_azure:
                     response = self.embedding_client.embeddings.create(
                         model=self.embedding_model,
                         input=sliced_filtered_input_content_list,
                     )
+                    for index, data in enumerate(response.data):
+                        content_to_embedding_dict[sliced_filtered_input_content_list[index]] = data.embedding
                 else:
                     response = self.embedding_client.embeddings.create(
                         model=self.embedding_model,
                         input=sliced_filtered_input_content_list,
                     )
-                for index, data in enumerate(response.data):
-                    content_to_embedding_dict[sliced_filtered_input_content_list[index]] = data.embedding
+                    for index, data in enumerate(response.data):
+                        content_to_embedding_dict[sliced_filtered_input_content_list[index]] = data.embedding
 
                 if self.dump_embedding_cache:
                     self.cache.embedding_set(content_to_embedding_dict)

@@ -26,7 +26,7 @@
 │  └──────────────────────────────────────────────────┘  │
 │            ↕ HTTP REST API + WebSocket                  │
 │  ┌──────────────────────────────────────────────────┐  │
-│  │       FastAPI 后端 (localhost:8000)              │  │
+│  │       FastAPI 后端 (localhost:8005)              │  │
 │  │  - REST API (任务管理、因子库读取)               │  │
 │  │  - WebSocket (实时日志/进度推送)                  │  │
 │  │  - 子进程调用 quantaalpha CLI                    │  │
@@ -61,7 +61,7 @@ bash start.sh
 - ✅ 检查 Node.js 和 Python 环境
 - ✅ 安装前端依赖 (`npm install`)
 - ✅ 安装后端依赖 (`pip install`)
-- ✅ 启动后端服务 (端口 8000)
+- ✅ 启动后端服务 (端口 8005)
 - ✅ 启动前端服务 (端口 3000)
 
 ### 方法 2: 手动启动
@@ -84,8 +84,8 @@ npm run dev
 ### 访问应用
 
 - 🌐 **前端界面**: http://localhost:3000
-- 🔧 **API 文档**: http://localhost:8000/docs
-- 📊 **健康检查**: http://localhost:8000/api/health
+- 🔧 **API 文档**: http://localhost:8005/docs
+- 📊 **健康检查**: http://localhost:8005/api/health
 
 ## 💡 使用流程
 
@@ -152,12 +152,12 @@ npm install
 
 ### 后端启动报错 "Address already in use"
 ```bash
-lsof -ti:8000 | xargs kill -9
+lsof -ti:8005 | xargs kill -9
 python backend/app.py
 ```
 
 ### WebSocket 连接失败
-- 确认后端运行在 8000 端口
+- 确认后端运行在 8005 端口
 - 检查浏览器控制台是否有 CORS 错误
 - Vite 代理配置会自动转发 `/ws` 到后端
 
@@ -192,7 +192,7 @@ frontend-v2/
 │   └── requirements.txt           # Python 后端依赖
 ├── start.sh                       # 一键启动脚本
 ├── package.json                   # 前端依赖
-├── vite.config.ts                 # Vite 配置（代理 /api → 8000）
+├── vite.config.ts                 # Vite 配置（代理 /api → 8005）
 └── tailwind.config.js             # TailwindCSS 配置
 ```
 
