@@ -16,7 +16,7 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -95,6 +95,11 @@ class ApiResponse(BaseModel):
 tasks: Dict[str, Dict[str, Any]] = {}
 ws_connections: Dict[str, List[WebSocket]] = {}  # task_id -> list of WS
 
+TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+TASK_RETENTION_SECONDS = int(os.getenv("TASK_RETENTION_SECONDS", str(24 * 3600)))
+TASK_MAX_COMPLETED = int(os.getenv("TASK_MAX_COMPLETED", "200"))
+CLEANUP_INTERVAL_SECONDS = int(os.getenv("TASK_CLEANUP_INTERVAL_SECONDS", "60"))
+
 
 # ========================== Utility Helpers ==========================
 
@@ -104,6 +109,67 @@ def _gen_id() -> str:
 
 def _now() -> str:
     return datetime.now().isoformat()
+
+
+def _parse_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _mark_task_terminal(task: Dict[str, Any], status: str):
+    """Set terminal status and completion timestamp for a task."""
+    task["status"] = status
+    now = _now()
+    task["completedAt"] = now
+    task["updatedAt"] = now
+
+
+def _cleanup_tasks() -> int:
+    """Cleanup expired terminal tasks and stale websocket/log state."""
+    now = datetime.now()
+    removed_task_ids: Set[str] = set()
+
+    terminal_items: List[Tuple[str, Dict[str, Any]]] = []
+    for task_id, task in tasks.items():
+        status = task.get("status")
+        if status in TERMINAL_TASK_STATUSES:
+            terminal_items.append((task_id, task))
+
+    # TTL-based cleanup for terminal tasks only
+    if TASK_RETENTION_SECONDS > 0:
+        for task_id, task in terminal_items:
+            completed_at = _parse_dt(task.get("completedAt")) or _parse_dt(task.get("updatedAt"))
+            if completed_at and (now - completed_at).total_seconds() > TASK_RETENTION_SECONDS:
+                removed_task_ids.add(task_id)
+
+    # Max completed tasks cleanup: keep latest N terminal tasks
+    if TASK_MAX_COMPLETED > 0:
+        keep_candidates = [
+            (task_id, task) for task_id, task in terminal_items if task_id not in removed_task_ids
+        ]
+        keep_candidates.sort(
+            key=lambda item: _parse_dt(item[1].get("completedAt")) or _parse_dt(item[1].get("updatedAt")) or datetime.min,
+            reverse=True,
+        )
+        for task_id, _ in keep_candidates[TASK_MAX_COMPLETED:]:
+            removed_task_ids.add(task_id)
+
+    for task_id in removed_task_ids:
+        tasks.pop(task_id, None)
+        ws_connections.pop(task_id, None)
+
+    return len(removed_task_ids)
+
+
+async def _task_cleanup_worker():
+    """Periodic lightweight cleanup for expired historical tasks."""
+    while True:
+        _cleanup_tasks()
+        await asyncio.sleep(max(CLEANUP_INTERVAL_SECONDS, 10))
 
 
 def _load_dotenv_dict() -> Dict[str, str]:
@@ -419,19 +485,19 @@ async def _run_mining(task_id: str, req: MiningStartRequest):
         task["pid"] = None
 
         if exit_code == 0:
-            task["status"] = "completed"
+            _mark_task_terminal(task, "completed")
             task["progress"]["phase"] = "completed"
             task["progress"]["progress"] = 100
             task["progress"]["message"] = "实验完成"
         else:
-            task["status"] = "failed"
+            _mark_task_terminal(task, "failed")
             task["progress"]["message"] = f"实验失败 (exit code: {exit_code})"
-
-        task["updatedAt"] = _now()
 
         # Load final factor count from the library JSON
         # Prefer the library file matching the librarySuffix for this experiment
         _update_mining_metrics(task)
+
+        _cleanup_tasks()
 
         await _broadcast(task_id, {
             "type": "result",
@@ -441,9 +507,9 @@ async def _run_mining(task_id: str, req: MiningStartRequest):
         })
 
     except Exception as e:
-        task["status"] = "failed"
+        _mark_task_terminal(task, "failed")
+        _cleanup_tasks()
         task["progress"]["message"] = f"Error: {str(e)}"
-        task["updatedAt"] = _now()
         await _broadcast(task_id, {
             "type": "error",
             "taskId": task_id,
@@ -459,17 +525,37 @@ async def root():
     return {"message": "QuantaAlpha API", "version": "2.0.0"}
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Start periodic task cleanup for historical task retention."""
+    asyncio.create_task(_task_cleanup_worker())
+
+
 @app.get("/api/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": _now()}
+    _cleanup_tasks()
+    return {
+        "status": "healthy",
+        "timestamp": _now(),
+        "taskRetention": {
+            "ttlSeconds": TASK_RETENTION_SECONDS,
+            "maxCompleted": TASK_MAX_COMPLETED,
+        },
+    }
 
 
 # ---- Mining endpoints ----
 
 @app.post("/api/v1/mining/start", response_model=ApiResponse)
 async def start_mining(req: MiningStartRequest):
-    """Start a new factor mining experiment."""
+    """Start a new factor mining experiment.
+
+    历史任务会按保留窗口自动清理：仅保留最近一段时间内的已结束任务，
+    且保留数量受 TASK_MAX_COMPLETED 限制。
+    """
     task_id = _gen_id()
+    _cleanup_tasks()
+
     task = {
         "taskId": task_id,
         "status": "running",
@@ -493,6 +579,7 @@ async def start_mining(req: MiningStartRequest):
         "pid": None,
         "createdAt": _now(),
         "updatedAt": _now(),
+        "completedAt": None,
     }
     tasks[task_id] = task
 
@@ -509,6 +596,7 @@ async def start_mining(req: MiningStartRequest):
 @app.get("/api/v1/mining/{task_id}", response_model=ApiResponse)
 async def get_mining_status(task_id: str):
     """Get task status."""
+    _cleanup_tasks()
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     return ApiResponse(success=True, data={"task": tasks[task_id]})
@@ -542,8 +630,8 @@ async def cancel_mining(task_id: str):
                 pass
         except ProcessLookupError:
             pass
-    task["status"] = "cancelled"
-    task["updatedAt"] = _now()
+    _mark_task_terminal(task, "cancelled")
+    _cleanup_tasks()
     await _broadcast(task_id, {
         "type": "result",
         "taskId": task_id,
@@ -555,9 +643,24 @@ async def cancel_mining(task_id: str):
 
 @app.get("/api/v1/mining/tasks/list", response_model=ApiResponse)
 async def list_tasks():
-    """List all tasks."""
+    """List all tasks.
+
+    历史任务保留窗口：默认仅保留最近 24 小时内完成的任务，
+    且最多保留最近 200 个已结束任务（completed/failed/cancelled）。
+    可通过环境变量 TASK_RETENTION_SECONDS 与 TASK_MAX_COMPLETED 调整。
+    """
+    _cleanup_tasks()
     task_list = sorted(tasks.values(), key=lambda t: t["createdAt"], reverse=True)
-    return ApiResponse(success=True, data={"tasks": task_list})
+    return ApiResponse(
+        success=True,
+        data={
+            "tasks": task_list,
+            "retention": {
+                "ttlSeconds": TASK_RETENTION_SECONDS,
+                "maxCompleted": TASK_MAX_COMPLETED,
+            },
+        },
+    )
 
 
 # ---- Factor library endpoints ----
@@ -775,6 +878,8 @@ async def start_backtest(req: BacktestStartRequest):
     task_id = _gen_id()
     config_path = req.configPath or str(PROJECT_ROOT / "configs" / "backtest.yaml")
 
+    _cleanup_tasks()
+
     task = {
         "taskId": task_id,
         "status": "running",
@@ -794,6 +899,7 @@ async def start_backtest(req: BacktestStartRequest):
         "pid": None,
         "createdAt": _now(),
         "updatedAt": _now(),
+        "completedAt": None,
     }
     tasks[task_id] = task
 
@@ -809,6 +915,7 @@ async def start_backtest(req: BacktestStartRequest):
 @app.get("/api/v1/backtest/{task_id}", response_model=ApiResponse)
 async def get_backtest_status(task_id: str):
     """Get backtest task status and results."""
+    _cleanup_tasks()
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     return ApiResponse(success=True, data={"task": tasks[task_id]})
@@ -825,8 +932,8 @@ async def cancel_backtest(task_id: str):
             os.kill(task["pid"], signal.SIGTERM)
         except ProcessLookupError:
             pass
-    task["status"] = "cancelled"
-    task["updatedAt"] = _now()
+    _mark_task_terminal(task, "cancelled")
+    _cleanup_tasks()
     await _broadcast(task_id, {
         "type": "result",
         "taskId": task_id,
@@ -988,8 +1095,10 @@ async def _run_backtest(task_id: str, req: BacktestStartRequest, config_path: st
         # --- Process exit ---
         exit_code = await proc.wait()
         task["pid"] = None
-        task["status"] = "completed" if exit_code == 0 else "failed"
-        task["updatedAt"] = _now()
+        if exit_code == 0:
+            _mark_task_terminal(task, "completed")
+        else:
+            _mark_task_terminal(task, "failed")
 
         # Try to load backtest results from output metrics JSON
         if exit_code == 0:
@@ -999,6 +1108,8 @@ async def _run_backtest(task_id: str, req: BacktestStartRequest, config_path: st
             _load_backtest_results(task)
         else:
             task["progress"]["message"] = f"回测失败 (exit code: {exit_code})"
+
+        _cleanup_tasks()
 
         await _broadcast(task_id, {
             "type": "result",
@@ -1013,9 +1124,9 @@ async def _run_backtest(task_id: str, req: BacktestStartRequest, config_path: st
     except Exception as e:
         import traceback
         traceback.print_exc()
-        task["status"] = "failed"
+        _mark_task_terminal(task, "failed")
+        _cleanup_tasks()
         task["progress"]["message"] = str(e)
-        task["updatedAt"] = _now()
         await _broadcast(task_id, {
             "type": "error",
             "taskId": task_id,
