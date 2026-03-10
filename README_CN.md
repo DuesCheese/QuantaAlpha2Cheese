@@ -226,6 +226,24 @@ python -m quantaalpha.backtest.run_backtest \
 
 结果保存在 `configs/backtest.yaml` 中 `experiment.output_dir` 指定的目录。
 
+#### 4G 机器推荐参数（低内存预设）
+
+如果机器内存仅 4G，建议先使用低内存配置 `configs/backtest_low_mem.yaml`：
+
+- `model.params.num_threads: 1`
+- `factor_calculation.n_jobs: 1`
+- 先跑短窗口（例如 2022 年），再按年份/季度分段回测并汇总结果
+- 自定义因子优先复用缓存，首次建议只回测已缓存因子（`--skip-uncached`）
+
+```bash
+# 4G 机器：优先只使用已缓存因子，确保先跑通流程
+python -m quantaalpha.backtest.run_backtest \
+  -c configs/backtest_low_mem.yaml \
+  --factor-source custom \
+  --factor-json all_factors_library.json \
+  --skip-uncached -v
+```
+
 > 📘 需要帮助？请查阅完整的 **[用户指南](docs/user_guide.md)**，了解高级配置、实验复现和详细使用示例。
 
 ---
