@@ -101,7 +101,8 @@ class FactorConsistencyChecker:
             response = APIBackend().build_messages_and_create_chat_completion(
                 user_prompt=user_prompt,
                 system_prompt=system_prompt,
-                json_mode=True
+                json_mode=True,
+                caller_tag="factor_consistency_check",
             )
             
             result_dict = robust_json_parse(response)

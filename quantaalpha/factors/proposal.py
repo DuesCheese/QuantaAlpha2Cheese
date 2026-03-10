@@ -271,7 +271,7 @@ class AlphaAgentHypothesisGen(FactorHypothesisGen):
                     )
                 )
 
-                resp = APIBackend().build_messages_and_create_chat_completion(user_prompt, system_prompt, json_mode=json_flag)
+                resp = APIBackend().build_messages_and_create_chat_completion(user_prompt, system_prompt, json_mode=json_flag, caller_tag="factor_hypothesis_gen")
                 hypothesis = self.convert_response(resp)
                 return hypothesis
             
@@ -304,7 +304,7 @@ class AlphaAgentHypothesisGen(FactorHypothesisGen):
                 round=len(trace.hist)
             )
         )
-        resp = APIBackend().build_messages_and_create_chat_completion(user_prompt, system_prompt, json_mode=json_flag)
+        resp = APIBackend().build_messages_and_create_chat_completion(user_prompt, system_prompt, json_mode=json_flag, caller_tag="factor_hypothesis_gen_min_history")
         hypothesis = self.convert_response(resp)
         return hypothesis
     
@@ -439,7 +439,7 @@ class AlphaAgentHypothesis2FactorExpression(FactorHypothesis2Experiment):
             if flag:
                 break
                 
-            resp = APIBackend().build_messages_and_create_chat_completion(user_prompt, system_prompt, json_mode=json_flag)
+            resp = APIBackend().build_messages_and_create_chat_completion(user_prompt, system_prompt, json_mode=json_flag, caller_tag="hypothesis_to_experiment")
             try:
                 response_dict = robust_json_parse(resp)
             except json.JSONDecodeError as e:

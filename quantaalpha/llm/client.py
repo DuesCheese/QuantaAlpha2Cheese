@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import os
 import random
 import re
 import sqlite3
 import ssl
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -594,6 +594,7 @@ class APIBackend:
         system_prompt: str | None = None,
         former_messages: list | None = None,
         chat_cache_prefix: str = "",
+        caller_tag: str | None = None,
         *,
         shrink_multiple_break: bool = False,
         **kwargs: Any,
@@ -610,6 +611,7 @@ class APIBackend:
             messages=messages,
             chat_completion=True,
             chat_cache_prefix=chat_cache_prefix,
+            caller_tag=caller_tag,
             **kwargs,
         )
 
@@ -819,6 +821,7 @@ class APIBackend:
         json_mode: bool = False,
         add_json_in_prompt: bool = False,
         seed: Optional[int] = None,
+        caller_tag: str | None = None,
     ) -> str:
         """
         seed : Optional[int]
@@ -859,13 +862,10 @@ class APIBackend:
         if presence_penalty is None:
             presence_penalty = LLM_SETTINGS.chat_presence_penalty
 
-        # Use index 4 to skip the current function and intermediate calls,
-        # and get the locals of the caller's frame.
-        caller_locals = inspect.stack()[4].frame.f_locals
-        if "self" in caller_locals:
-            tag = caller_locals["self"].__class__.__name__
+        if caller_tag is not None:
+            tag = caller_tag
         else:
-            tag = inspect.stack()[4].function
+            tag = sys._getframe(1).f_code.co_name
             
         if reasoning_flag:
             model = self.reasoning_model
